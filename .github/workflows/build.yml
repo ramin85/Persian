@@ -19,13 +19,14 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 20
       - name: Restore scrape cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: .cache
           key: details-${{ github.run_id }}
@@ -33,8 +34,15 @@ jobs:
       - name: Scrape and generate addon
         run: node build.mjs
         env:
+          BUDGET_MIN: "40"
           TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
           # ALSO_SERVE_IMDB_IDS: "1"   # optional, see README
+      - name: Save scrape cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .cache
+          key: details-${{ github.run_id }}
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
