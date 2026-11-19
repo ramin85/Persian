@@ -13,8 +13,11 @@ export const CFG = {
   seriesHome: 'https://mobile.namakade.com/serial',
   outDir: process.env.OUT_DIR || 'dist',
   cacheFile: process.env.CACHE_FILE || '.cache/details.json',
-  concurrency: Number(process.env.CONCURRENCY || 4),
-  delayMs: Number(process.env.DELAY_MS || 200),
+  concurrency: Number(process.env.CONCURRENCY || 6),
+  delayMs: Number(process.env.DELAY_MS || 100),
+  // Stop fetching NEW pages after this many minutes, publish what we have, and
+  // keep the cache so the next run continues where this one stopped.
+  budgetMin: Number(process.env.BUDGET_MIN || 40),
   maxPages: Number(process.env.MAX_PAGES || 40), // per category
   maxItems: Number(process.env.MAX_ITEMS || 0), // 0 = unlimited (use a small number for test runs)
   streamHints: process.env.STREAM_HINTS !== '0', // adds notWebReady + Referer hint to streams
@@ -36,6 +39,7 @@ export const CFG = {
 const UA =
   'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+let deadline = Infinity; // set in main()
 const log = (...a) => console.log(...a);
 
 // ---------- HTTP ----------
@@ -46,6 +50,7 @@ async function get(url, retries = 3) {
       const r = await fetch(url, {
         headers: { 'user-agent': UA, 'accept-language': 'en-US,en;q=0.9', accept: 'text/html,*/*' },
         redirect: 'follow',
+        signal: AbortSignal.timeout(25000), // never hang on a stalled connection
       });
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       return await r.text();
@@ -57,9 +62,10 @@ async function get(url, retries = 3) {
   throw new Error(`${url}: ${lastErr?.message}`);
 }
 
-async function pool(items, n, fn) {
+async function pool(items, n, fn, label = '') {
   const out = new Array(items.length);
   let i = 0;
+  let done = 0;
   await Promise.all(
     Array.from({ length: Math.max(1, n) }, async () => {
       while (i < items.length) {
@@ -70,6 +76,7 @@ async function pool(items, n, fn) {
           console.warn('  ! ' + e.message);
           out[idx] = null;
         }
+        if (label && ++done % 100 === 0) log(`  ${label}: ${done}/${items.length}`);
         await sleep(CFG.delayMs);
       }
     }),
@@ -298,7 +305,14 @@ const saveCache = async (c) => {
 
 async function gather(kind, homeUrl) {
   log(`\n[${kind}] home: ${homeUrl}`);
-  const homeHtml = await get(homeUrl);
+  let homeHtml;
+  try {
+    homeHtml = await get(homeUrl);
+  } catch (e) {
+    throw new Error(
+      `${e.message}\n  Namakade did not answer. On GitHub Actions this usually means the site blocks GitHub's servers (see README, "Blocked runner").`,
+    );
+  }
   const items = parseListing(homeHtml, homeUrl, kind); // home first = "newest" ordering
   const cats = parseCategories(homeHtml, homeUrl, kind);
   log(`  home items: ${items.size}, categories: ${cats.size}`);
@@ -329,6 +343,7 @@ async function resolveMovies(list, cache) {
   const res = await pool(list, CFG.concurrency, async (it) => {
     const hit = cache.movies[it.url];
     if (hit?.stream) return { ...it, ...hit };
+    if (Date.now() > deadline) return null; // out of time: the next run continues from the cache
     const html = await get(it.url);
     const stream = pickStream(html);
     if (!stream) throw new Error(`no stream found: ${it.url}`);
@@ -339,13 +354,14 @@ async function resolveMovies(list, cache) {
     };
     cache.movies[it.url] = data;
     return { ...it, ...data };
-  });
+  }, 'movies');
   return res.filter(Boolean);
 }
 
 async function resolveSeries(list, cache) {
   log(`\nResolving ${list.length} series...`);
   const res = await pool(list, 2, async (it) => {
+    if (Date.now() > deadline && !cache.seriesSeen?.[it.url]) return null;
     const html = await get(it.url);
     let eps = parseEpisodes(html, it.url);
     for (const su of seasonLinks(html, it.url, it.key)) {
@@ -356,6 +372,7 @@ async function resolveSeries(list, cache) {
     const resolved = await pool([...eps.values()], CFG.concurrency, async (e) => {
       const hit = cache.episodes[e.url];
       if (hit?.stream) return { ...e, ...hit };
+      if (Date.now() > deadline) return null;
       const data = parseEpisodePage(await get(e.url), e.slug);
       if (!data.stream) throw new Error(`no stream found: ${e.url}`);
       cache.episodes[e.url] = data;
@@ -370,9 +387,14 @@ async function resolveSeries(list, cache) {
         const k = `${e.season}:${e.episode}`;
         return seen.has(k) ? false : (seen.add(k), true);
       });
-    if (!episodes.length) throw new Error(`no playable episodes: ${it.url}`);
+    if (!episodes.length) {
+      if (Date.now() > deadline) return null;
+      throw new Error(`no playable episodes: ${it.url}`);
+    }
+    cache.seriesSeen = cache.seriesSeen || {};
+    cache.seriesSeen[it.url] = 1;
     return { ...it, title: it.title || pageTitle(html), poster: metaImage(html) || it.thumb, episodes };
-  });
+  }, 'series');
   return res.filter(Boolean);
 }
 
@@ -389,7 +411,7 @@ async function tmdb(pathname, params = {}, attempt = 0) {
   else u.searchParams.set('api_key', CFG.tmdbKey);
   u.searchParams.set('language', 'en-US');
   for (const [k, v] of Object.entries(params)) if (v != null) u.searchParams.set(k, String(v));
-  const r = await fetch(u.href, { headers });
+  const r = await fetch(u.href, { headers, signal: AbortSignal.timeout(25000) });
   if (r.status === 404) return null;
   if (r.status === 429 && attempt < 4) {
     await sleep(1500 * (attempt + 1));
@@ -808,6 +830,7 @@ export async function writeAddon(movies, series, report = { matched: [], unmatch
 }
 
 export async function main() {
+  deadline = Date.now() + CFG.budgetMin * 60000;
   const cache = await loadCache();
   const [movieList, seriesList] = [
     await gather('movie', CFG.movieHome),
@@ -815,6 +838,10 @@ export async function main() {
   ];
   const movies = await resolveMovies(movieList, cache);
   const series = await resolveSeries(seriesList, cache);
+  await saveCache(cache); // save progress before the slower TMDB step
+  if (Date.now() > deadline) {
+    log(`\nTime budget (${CFG.budgetMin} min) reached: published what was ready. The next run continues from the cache.`);
+  }
   const report = await enrich(movies, series, cache);
   await saveCache(cache);
   const manifest = await writeAddon(movies, series, report);
